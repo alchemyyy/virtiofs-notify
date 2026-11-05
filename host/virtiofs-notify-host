@@ -1,0 +1,511 @@
+#!/usr/bin/python3
+"""Send host-side changes on virtiofs shares to the Proxmox VMs that mount them.
+
+A VM takes part when its config has a vsock device with a guest CID, e.g.
+    args: -device vhost-vsock-pci,guest-cid=103
+Its virtiofs shares (virtiofsN: <directory mapping>) are resolved through
+/etc/pve/mapping/directory.cfg.  The filesystems behind them are watched with fanotify
+and every change is sent to each VM whose share contains it, over vsock to
+virtiofs-notify-guest, as
+    "<share tag> <inotify mask> <dir relative to the share>\t<name>\n".
+A VM is not sent the changes it made itself through that share: its virtiofsd runs in
+the VM's cgroup (/qemu.slice/<vmid>.scope) with --shared-dir=<share path>.
+The configuration is re-read every minute; when it changes, the daemon re-executes.
+"""
+
+import ctypes
+import glob
+import os
+import posixpath
+import re
+import select
+import socket
+import struct
+import sys
+import threading
+import time
+from collections import deque
+
+PORT = 7380  # vsock port virtiofs-notify-guest listens on
+QUEUE_MAX = 4 << 20  # bytes queued per VM before events are dropped
+DEDUPE_SECONDS = 1.0
+RESCAN_SECONDS = 60
+KEEPALIVE_SECONDS = 60
+RETRY_SECONDS = 5
+
+PVE_VM_CONFIGS = "/etc/pve/qemu-server/*.conf"
+PVE_DIR_MAPPINGS = "/etc/pve/mapping/directory.cfg"
+
+# include/uapi/linux/fanotify.h
+FAN_CLOEXEC = 0x1
+FAN_NONBLOCK = 0x2
+FAN_CLASS_NOTIF = 0x0
+FAN_REPORT_DIR_FID = 0x400
+FAN_REPORT_NAME = 0x800
+FAN_MARK_ADD = 0x1
+FAN_MARK_FILESYSTEM = 0x100
+FAN_ATTRIB = 0x4
+FAN_CLOSE_WRITE = 0x8
+FAN_MOVED_FROM = 0x40
+FAN_MOVED_TO = 0x80
+FAN_CREATE = 0x100
+FAN_DELETE = 0x200
+FAN_Q_OVERFLOW = 0x4000
+FAN_ONDIR = 0x40000000
+FAN_EVENT_INFO_TYPE_DFID_NAME = 2
+FANOTIFY_METADATA_VERSION = 3
+METADATA = struct.Struct("=IBBHQii")  # struct fanotify_event_metadata
+INFO_HEADER = struct.Struct("=BBH")  # struct fanotify_event_info_header
+FID_HANDLE_OFFSET = 12  # header + __kernel_fsid_t
+FILE_HANDLE_HEADER = struct.Struct("=Ii")  # struct file_handle without f_handle
+AT_FDCWD = -100
+
+# include/uapi/linux/inotify.h
+IN_MODIFY = 0x2
+IN_ATTRIB = 0x4
+IN_CLOSE_WRITE = 0x8
+IN_MOVED_FROM = 0x40
+IN_MOVED_TO = 0x80
+IN_CREATE = 0x100
+IN_DELETE = 0x200
+IN_ISDIR = 0x40000000
+
+# fanotify bit -> inotify event(s), in the order a local filesystem would emit them
+EVENT_MAP = (
+    (FAN_CREATE, IN_CREATE),
+    (FAN_MOVED_FROM, IN_MOVED_FROM),
+    (FAN_MOVED_TO, IN_MOVED_TO),
+    (FAN_CLOSE_WRITE, IN_MODIFY),
+    (FAN_CLOSE_WRITE, IN_CLOSE_WRITE),
+    (FAN_ATTRIB, IN_ATTRIB),
+    (FAN_DELETE, IN_DELETE),
+)
+WATCH_MASK = (
+    FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_CLOSE_WRITE | FAN_ATTRIB | FAN_ONDIR
+)
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
+libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64, ctypes.c_int, ctypes.c_char_p]
+libc.open_by_handle_at.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+
+
+def log(msg):
+    # stdout goes to the journal under systemd
+    print(msg, flush=True)
+
+
+def os_error(what):
+    err = ctypes.get_errno()
+    return OSError(err, f"{what}: {os.strerror(err)}")
+
+
+# --- configuration -----------------------------------------------------------------------
+
+
+def read_mappings(node):
+    """Directory mapping id -> host path on this node."""
+    paths = {}
+    current = None
+    with open(PVE_DIR_MAPPINGS) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if not line[0].isspace():
+                current = line.strip().split(": ")[-1]
+                continue
+            key, _, value = line.strip().partition(" ")
+            if key == "map" and current:
+                fields = dict(kv.split("=", 1) for kv in value.split(",") if "=" in kv)
+                if fields.get("node") == node and "path" in fields:
+                    paths[current] = fields["path"]
+    return paths
+
+
+def read_vms(mappings):
+    """vmid -> (cid, [(tag, host path), ...]) for VMs with a vsock device and shares."""
+    vms = {}
+    for conf in glob.glob(PVE_VM_CONFIGS):
+        vmid = os.path.basename(conf)[: -len(".conf")]
+        cid, shares = None, []
+        with open(conf) as f:
+            for line in f:
+                if line.startswith("["):  # snapshots and pending changes follow
+                    break
+                key, _, value = line.partition(":")
+                value = value.strip()
+                if key == "args":
+                    m = re.search(r"vhost-vsock-pci\S*guest-cid=(\d+)", value)
+                    if m:
+                        cid = int(m.group(1))
+                elif re.fullmatch(r"virtiofs\d+", key):
+                    first = value.split(",")[0]
+                    opts = dict(kv.split("=", 1) for kv in value.split(",") if "=" in kv)
+                    tag = opts.get("dirid", first if "=" not in first else None)
+                    if tag in mappings:
+                        shares.append((tag, mappings[tag]))
+        if cid is not None and shares:
+            vms[vmid] = (cid, shares)
+    return vms
+
+
+def unescape(field):
+    # mountinfo encodes space, tab, newline and backslash as \ooo
+    raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), field)
+    return os.fsdecode(raw)
+
+
+def read_mounts():
+    """[(dev, root inside the filesystem, mount point)] in mount order."""
+    mounts = []
+    with open("/proc/self/mountinfo", "rb") as f:
+        for line in f:
+            fields = line.partition(b" - ")[0].split()
+            major, minor = fields[2].split(b":")
+            mounts.append((os.makedev(int(major), int(minor)), unescape(fields[3]), unescape(fields[4])))
+    return mounts
+
+
+def under(path, top):
+    return path == top or top == "/" or path.startswith(top.rstrip("/") + "/")
+
+
+def reference_mount(dev, mounts):
+    """A mount of the whole filesystem: handles are resolved through it."""
+    for mdev, root, mountpoint in mounts:
+        if mdev == dev and root == "/":
+            return mountpoint
+    return None
+
+
+def locate(path, mounts):
+    """(dev, reference mount, path as seen through the reference mount) or None."""
+    real = os.path.realpath(path)
+    dev = os.stat(real).st_dev
+    best = None
+    for mount in mounts:
+        if mount[0] == dev and under(real, mount[2]) and (best is None or len(mount[2]) >= len(best[2])):
+            best = mount
+    ref = reference_mount(dev, mounts)
+    if best is None or ref is None:
+        return None
+    rest = real[len(best[2]) :] if best[2] != "/" else real
+    return dev, ref, posixpath.normpath(f"{ref}/{best[1]}/{rest}")
+
+
+class Share:
+    def __init__(self, vmid, cid, tag, host_path, canonical):
+        self.vmid, self.cid, self.tag, self.host_path = vmid, cid, tag, host_path
+        self.tag_b = tag.encode()
+        self.canonical = os.fsencode(canonical)
+        self.prefix = self.canonical.rstrip(b"/") + b"/"
+
+    def relative(self, directory):
+        """The directory relative to this share, or None if it lies outside."""
+        if directory == self.canonical:
+            return b"/"
+        if self.canonical == b"/":
+            return directory
+        if directory.startswith(self.prefix):
+            return directory[len(self.prefix) - 1 :]
+        return None
+
+    def key(self):
+        return (self.vmid, self.cid, self.tag, self.host_path, self.canonical)
+
+
+def load():
+    """Shares of all participating VMs, and dev -> reference mount of every filesystem."""
+    mappings = read_mappings(socket.gethostname().split(".")[0])
+    mounts = read_mounts()
+    shares, filesystems = [], {}
+    for vmid, (cid, vm_shares) in sorted(read_vms(mappings).items()):
+        for tag, host_path in vm_shares:
+            try:
+                found = locate(host_path, mounts)
+            except OSError as e:
+                found = None
+                log(f"VM {vmid}: share {tag} ({host_path}): {e.strerror}")
+            if found is None:
+                continue
+            dev, ref, canonical = found
+            filesystems[dev] = ref
+            # Filesystems mounted inside the share (virtiofsd --announce-submounts).
+            real = os.path.realpath(host_path)
+            for mdev, _, mountpoint in mounts:
+                if mdev != dev and mountpoint != real and under(mountpoint, real):
+                    nested = reference_mount(mdev, mounts)
+                    if nested:
+                        filesystems[mdev] = nested
+            shares.append(Share(vmid, cid, tag, host_path, canonical))
+    return shares, filesystems
+
+
+def fingerprint(shares, filesystems):
+    return (tuple(s.key() for s in shares), tuple(sorted(filesystems.items())))
+
+
+# --- event sources -----------------------------------------------------------------------
+
+
+class Filesystem:
+    def __init__(self, dev, ref):
+        self.dev, self.ref = dev, ref
+        flags = FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_DIR_FID | FAN_REPORT_NAME
+        self.fd = libc.fanotify_init(flags, os.O_RDONLY | os.O_CLOEXEC | os.O_LARGEFILE)
+        if self.fd < 0:
+            raise os_error("fanotify_init")
+        if libc.fanotify_mark(self.fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, WATCH_MASK, AT_FDCWD, os.fsencode(ref)) < 0:
+            raise os_error(f"fanotify_mark {ref}")
+        # Not O_PATH: open_by_handle_at() rejects O_PATH mount descriptors.
+        self.mount_fd = os.open(ref, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    def events(self):
+        """(mask, pid, info records) of the queued events."""
+        try:
+            buf = os.read(self.fd, 256 * 1024)
+        except BlockingIOError:
+            return
+        off = 0
+        while off + METADATA.size <= len(buf):
+            event_len, version, _, meta_len, mask, fd, pid = METADATA.unpack_from(buf, off)
+            if event_len < METADATA.size or off + event_len > len(buf):
+                break
+            if fd >= 0:
+                os.close(fd)  # not expected in FID mode
+            if version == FANOTIFY_METADATA_VERSION:
+                yield mask, pid, buf[off + max(meta_len, METADATA.size) : off + event_len]
+            off += event_len
+
+    def dir_path(self, handle):
+        """Host path of the directory behind a file handle, or None if it is gone."""
+        fd = libc.open_by_handle_at(self.mount_fd, handle, os.O_PATH | os.O_CLOEXEC)
+        if fd < 0:
+            return None
+        try:
+            path = os.readlink(b"/proc/self/fd/%d" % fd)
+            st = os.fstat(fd)
+            try:
+                lst = os.lstat(path)
+            except OSError:
+                return None
+            # Deleted or unreachable directories read back as something else.
+            return path if (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino) else None
+        finally:
+            os.close(fd)
+
+
+def dfid_names(info):
+    """(file handle, name) of every DFID_NAME record."""
+    off = 0
+    while off + INFO_HEADER.size <= len(info):
+        info_type, _, length = INFO_HEADER.unpack_from(info, off)
+        if length < INFO_HEADER.size or off + length > len(info):
+            return
+        if info_type == FAN_EVENT_INFO_TYPE_DFID_NAME:
+            record = info[off : off + length]
+            start = FID_HANDLE_OFFSET
+            if len(record) >= start + FILE_HANDLE_HEADER.size:
+                handle_bytes, _ = FILE_HANDLE_HEADER.unpack_from(record, start)
+                end = start + FILE_HANDLE_HEADER.size + handle_bytes
+                if end <= len(record):
+                    yield record[start:end], record[end:].split(b"\0", 1)[0]
+        off += length
+
+
+class Sources:
+    """Which VM share, if any, a process belongs to: (vmid, --shared-dir)."""
+
+    def __init__(self):
+        self.cache = {}
+
+    def lookup(self, pid):
+        now = time.monotonic()
+        hit = self.cache.get(pid)
+        if hit and now - hit[1] < 10:
+            return hit[0]
+        source = None
+        try:
+            with open(f"/proc/{pid}/cgroup", "rb") as f:
+                m = re.search(rb"/qemu\.slice/(\d+)\.scope$", f.read(), re.M)
+            if m:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    args = f.read().split(b"\0")
+                for i, arg in enumerate(args):
+                    if arg.startswith(b"--shared-dir="):
+                        source = (m.group(1).decode(), os.fsdecode(arg[len(b"--shared-dir=") :]))
+                    elif arg == b"--shared-dir" and i + 1 < len(args):
+                        source = (m.group(1).decode(), os.fsdecode(args[i + 1]))
+        except OSError:
+            pass
+        if len(self.cache) > 4096:
+            self.cache.clear()
+        self.cache[pid] = (source, now)
+        return source
+
+
+# --- delivery ------------------------------------------------------------------------------
+
+
+class Sender(threading.Thread):
+    """Keeps a vsock connection to one VM and writes its events to it."""
+
+    def __init__(self, vmid, cid):
+        super().__init__(name=f"vm{vmid}", daemon=True)
+        self.vmid, self.cid = vmid, cid
+        self.cond = threading.Condition()
+        self.connected = False
+        self.queue = deque()
+        self.bytes = 0
+        self.dropped = 0
+        self.recent = {}
+
+    def push(self, line, dedupe=True):
+        with self.cond:
+            # Nobody is listening: don't keep events for a guest that isn't there.
+            if not self.connected:
+                return
+            if dedupe:
+                now = time.monotonic()
+                last = self.recent.get(line)
+                if last is not None and now - last < DEDUPE_SECONDS:
+                    return
+                if len(self.recent) > 8192:
+                    self.recent = {k: t for k, t in self.recent.items() if now - t < DEDUPE_SECONDS}
+                self.recent[line] = now
+            if self.bytes + len(line) > QUEUE_MAX:
+                self.dropped += 1
+                return
+            self.queue.append(line)
+            self.bytes += len(line)
+            self.cond.notify()
+
+    def run(self):
+        failing = None
+        while True:
+            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(RETRY_SECONDS)
+                sock.connect((self.cid, PORT))
+            except OSError as e:
+                sock.close()
+                reason = e.strerror or str(e) or type(e).__name__
+                if reason != failing:
+                    log(f"VM {self.vmid} (cid {self.cid}): {reason}; retrying every {RETRY_SECONDS}s")
+                    failing = reason
+                time.sleep(RETRY_SECONDS)
+                continue
+            failing = None
+            log(f"VM {self.vmid} (cid {self.cid}): connected")
+            with self.cond:
+                self.connected = True
+            try:
+                sock.settimeout(30)
+                self.pump(sock)
+            except OSError as e:
+                log(f"VM {self.vmid}: {e.strerror or e or type(e).__name__}; reconnecting")
+            finally:
+                with self.cond:
+                    self.connected = False
+                    self.queue.clear()
+                    self.bytes = 0
+                    self.dropped = 0
+                    self.recent.clear()
+                sock.close()
+            time.sleep(1)
+
+    def pump(self, sock):
+        while True:
+            with self.cond:
+                if not self.queue and not self.dropped:
+                    self.cond.wait(KEEPALIVE_SECONDS)
+                data = b"".join(self.queue)
+                self.queue.clear()
+                self.bytes = 0
+                dropped, self.dropped = self.dropped, 0
+            if dropped:
+                data += b"# %d events dropped: queue full\n" % dropped
+            # An empty line doubles as keepalive, so a dead connection is noticed.
+            sock.sendall(data or b"\n")
+
+
+# --- main ------------------------------------------------------------------------------------
+
+
+def route(mask, directory, name, pid, shares, senders, sources):
+    isdir = IN_ISDIR if mask & FAN_ONDIR else 0
+    source = None
+    looked_up = False
+    for share in shares:
+        rel = share.relative(directory)
+        if rel is None:
+            continue
+        if not looked_up:
+            source, looked_up = sources.lookup(pid), True
+        if source == (share.vmid, share.host_path):
+            continue  # the guest made this change itself and has seen it already
+        sender = senders[share.vmid]
+        for fan_bit, in_mask in EVENT_MAP:
+            if mask & fan_bit:
+                sender.push(b"%s %#x %s\t%s\n" % (share.tag_b, in_mask | isdir, rel, name))
+
+
+def main():
+    shares, filesystems = load()
+    current = fingerprint(shares, filesystems)
+    if not shares:
+        log(f"no VM with a vsock device and virtiofs shares; rescanning every {RESCAN_SECONDS}s")
+
+    senders = {}
+    for share in shares:
+        if share.vmid not in senders:
+            senders[share.vmid] = Sender(share.vmid, share.cid)
+            senders[share.vmid].start()
+        shown = share.host_path if share.canonical == os.fsencode(share.host_path) else (
+            f"{share.host_path} = {os.fsdecode(share.canonical)}"
+        )
+        log(f"VM {share.vmid} (cid {share.cid}): share {share.tag} ({shown})")
+
+    watched = {}
+    for dev, ref in sorted(filesystems.items()):
+        fs = Filesystem(dev, ref)
+        watched[fs.fd] = fs
+        log(f"watching the filesystem mounted at {ref}")
+
+    poller = select.poll()
+    for fd in watched:
+        poller.register(fd, select.POLLIN)
+    sources = Sources()
+    next_scan = time.monotonic() + RESCAN_SECONDS
+    while True:
+        timeout = max(0.0, next_scan - time.monotonic())
+        for fd, _ in poller.poll(timeout * 1000):
+            fs = watched[fd]
+            for mask, pid, info in fs.events():
+                if mask & FAN_Q_OVERFLOW:
+                    log("fanotify queue overflow: events were lost")
+                    for sender in senders.values():
+                        sender.push(b"# host event queue overflowed: events were lost\n", dedupe=False)
+                    continue
+                for handle, name in dfid_names(info):
+                    # "." is the directory itself; tabs and newlines would break the protocol.
+                    if not name or name == b"." or b"\n" in name or b"\t" in name:
+                        continue
+                    directory = fs.dir_path(handle)
+                    if directory is None or b"\n" in directory or b"\t" in directory:
+                        continue
+                    route(mask, directory, name, pid, shares, senders, sources)
+        if time.monotonic() >= next_scan:
+            next_scan = time.monotonic() + RESCAN_SECONDS
+            try:
+                changed = fingerprint(*load()) != current
+            except OSError as e:
+                log(f"re-reading the configuration failed: {e}")
+                changed = False
+            if changed:
+                log("configuration changed; restarting")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+if __name__ == "__main__":
+    main()

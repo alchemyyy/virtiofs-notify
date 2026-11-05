@@ -1,0 +1,11 @@
+Package: virtiofs-notify-guest
+Version: 1.1
+Architecture: all
+Maintainer: local <root@localhost>
+Depends: dkms, python3, linux-headers-amd64
+Section: kernel
+Priority: optional
+Description: replay host-side virtiofs changes as inotify events
+ Receives change events from virtiofs-notify-host on the Proxmox host over vsock and
+ fires them through the inotify_trigger kernel module (built with DKMS), so programs
+ watching virtiofs mounts with inotify see changes made on the host or by other VMs.

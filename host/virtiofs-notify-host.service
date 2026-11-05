@@ -1,0 +1,20 @@
+[Unit]
+Description=Send host-side changes on virtiofs shares to VMs over vsock (virtiofs-notify)
+Wants=pve-cluster.service
+After=pve-cluster.service local-fs.target zfs-mount.service
+
+[Service]
+ExecStart=/usr/sbin/virtiofs-notify-host
+Restart=always
+RestartSec=5
+# fanotify filesystem marks need CAP_SYS_ADMIN, resolving their file handles
+# CAP_DAC_READ_SEARCH; nothing else.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_VSOCK
+
+[Install]
+WantedBy=multi-user.target

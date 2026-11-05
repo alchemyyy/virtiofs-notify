@@ -1,0 +1,161 @@
+#!/usr/bin/python3
+"""Replay host-side virtiofs changes as inotify events.
+
+Listens on vsock port 7380 for virtiofs-notify-host on the Proxmox host (only the host,
+CID 2, is accepted) and receives lines
+    "<share tag> <inotify mask> <dir relative to the share>\t<name>".
+The tag is the virtiofs mount source; each event is fired on the matching mount point
+through /proc/inotify_trigger (inotify_trigger module), so programs watching that
+directory with inotify see the change as if it had happened locally.
+"""
+
+import os
+import re
+import socket
+import threading
+import time
+
+PORT = 7380
+TRIGGER = "/proc/inotify_trigger"
+TRIGGER_MAX = 4096  # inotify_trigger rejects writes larger than this
+# inotify bits that describe a change of a directory entry; everything else (MODIFY,
+# ATTRIB, CLOSE_WRITE) is an event on the child itself.
+DIRENT_EVENTS = 0x40 | 0x80 | 0x100 | 0x200  # MOVED_FROM | MOVED_TO | CREATE | DELETE
+
+
+def log(msg):
+    # stdout goes to the journal under systemd
+    print(msg, flush=True)
+
+
+def unescape(field):
+    # mountinfo encodes space, tab, newline and backslash as \ooo
+    return re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m.group(1), 8)]), field)
+
+
+def virtiofs_mounts():
+    """virtiofs tag -> mount point of the whole share."""
+    found = {}
+    with open("/proc/self/mountinfo", "rb") as f:
+        for line in f:
+            pre, _, post = line.partition(b" - ")
+            fields, tail = pre.split(), post.split()
+            if len(fields) < 5 or len(tail) < 2 or tail[0] != b"virtiofs" or fields[3] != b"/":
+                continue
+            found.setdefault(tail[1], unescape(fields[4]).rstrip(b"/"))
+    return found
+
+
+class Mounts:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.map = virtiofs_mounts()
+        self.loaded = time.monotonic()
+        self.reported = set()
+
+    def get(self, tag):
+        with self.lock:
+            mountpoint = self.map.get(tag)
+            if mountpoint is None and time.monotonic() - self.loaded > 5:
+                self.map, self.loaded = virtiofs_mounts(), time.monotonic()
+                mountpoint = self.map.get(tag)
+            if mountpoint is None and tag not in self.reported:
+                log(f"no virtiofs mount with tag {tag.decode(errors='replace')!r}; ignoring its events")
+                self.reported.add(tag)
+            return mountpoint
+
+
+def translate(line, mounts):
+    """inotify_trigger writes for one event, in order of preference, or None."""
+    tag, sep1, rest = line.partition(b" ")
+    mask, sep2, rest = rest.partition(b" ")
+    directory, sep3, name = rest.partition(b"\t")
+    if not (sep1 and sep2 and sep3 and name) or not directory.startswith(b"/"):
+        return None
+    if b"/" in name or name in (b".", b"..") or b".." in directory.split(b"/"):
+        return None
+    try:
+        mask_value = int(mask, 16)
+    except ValueError:
+        return None
+    mountpoint = mounts.get(tag)
+    if mountpoint is None:
+        return None
+    local = mountpoint + (directory if directory != b"/" else b"")
+    dir_event = mask + b" " + (local or b"/") + b"\t" + name + b"\n"
+    if mask_value & DIRENT_EVENTS:
+        return [dir_event]
+    # Fired on the child so watchers of its directory get the name (the dir+name form
+    # reports these without a name); falls back if the child is already gone.
+    return [mask + b" " + local + b"/" + name + b"\n", dir_event]
+
+
+def inject(trigger, candidates):
+    # One write per event: the module stops at the first line it cannot resolve (e.g. the
+    # directory is already gone again), and that must not swallow other events.
+    for line in candidates:
+        if len(line) > TRIGGER_MAX:
+            continue
+        try:
+            trigger.write(line)
+            return
+        except OSError:
+            continue
+
+
+def serve(conn, mounts):
+    pending = b""
+    with conn, open(TRIGGER, "wb", buffering=0) as trigger:
+        while True:
+            chunk = conn.recv(1 << 16)
+            if not chunk:
+                return
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                if not line:
+                    continue  # keepalive
+                if line.startswith(b"#"):
+                    log(f"host: {line[1:].strip().decode(errors='replace')}")
+                    continue
+                candidates = translate(line, mounts)
+                if candidates:
+                    inject(trigger, candidates)
+
+
+def handle(conn, mounts):
+    log("host connected")
+    try:
+        serve(conn, mounts)
+        log("host disconnected")
+    except OSError as e:
+        log(f"connection from host: {e.strerror or e}")
+
+
+def listen():
+    while True:
+        srv = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        try:
+            srv.bind((socket.VMADDR_CID_ANY, PORT))
+            srv.listen(4)
+            return srv
+        except OSError as e:
+            srv.close()
+            log(f"vsock port {PORT}: {e.strerror}; retrying in 10s")
+            time.sleep(10)
+
+
+def main():
+    mounts = Mounts()
+    srv = listen()
+    log(f"listening on vsock port {PORT}")
+    while True:
+        conn, (cid, _) = srv.accept()
+        if cid != socket.VMADDR_CID_HOST:
+            conn.close()
+            continue
+        threading.Thread(target=handle, args=(conn, mounts), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

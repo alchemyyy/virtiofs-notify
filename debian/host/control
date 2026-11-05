@@ -1,0 +1,11 @@
+Package: virtiofs-notify-host
+Version: 1.0
+Architecture: all
+Maintainer: local <root@localhost>
+Depends: python3
+Section: admin
+Priority: optional
+Description: send host-side changes on virtiofs shares to Proxmox VMs
+ Watches the filesystems behind the virtiofs shares of every VM with a vsock device
+ (args: -device vhost-vsock-pci,guest-cid=N) using fanotify, and sends each change the
+ VM did not make itself to virtiofs-notify-guest in that VM.

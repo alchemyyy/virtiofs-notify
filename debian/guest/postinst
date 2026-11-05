@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+# Must match guest/inotify_trigger/dkms.conf.
+DKMS_NAME=inotify-trigger
+DKMS_VERSION=1.0
+UNIT=virtiofs-notify-guest.service
+
+if [ "$1" = configure ]; then
+    /usr/lib/dkms/common.postinst "$DKMS_NAME" "$DKMS_VERSION" "" "" "$2"
+fi
+
+if [ "$1" = configure ] || [ "$1" = abort-upgrade ] || [ "$1" = abort-deconfigure ] || [ "$1" = abort-remove ]; then
+    # was-enabled defaults to true, so new installations get enabled.
+    if deb-systemd-helper --quiet was-enabled "$UNIT"; then
+        deb-systemd-helper enable "$UNIT" >/dev/null || true
+    else
+        deb-systemd-helper update-state "$UNIT" >/dev/null || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+        if [ -n "$2" ]; then action=restart; else action=start; fi
+        deb-systemd-invoke "$action" "$UNIT" >/dev/null || true
+    fi
+fi
