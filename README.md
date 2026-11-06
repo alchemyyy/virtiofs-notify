@@ -17,7 +17,7 @@ virtiofs-notify fills that gap. virtiofsd, QEMU and the guest kernel stay stock:
         │                                           │   tag "video" → /mnt/video  │
         ▼                                           │   → /proc/inotify_trigger   │
  ┌──────────────────────────────┐  vsock, port 7380 │     (inotify_trigger.ko)    │
- │ virtiofs-notify-host         │ ────────────────▶ │            │                │
+ │ virtiofs-notify-host         │ ───────────────>  │            │                │
  │   one fanotify mark per      │  video 0x100      │            ▼                │
  │   filesystem                 │  /Movies\tX.mkv   │   inotify watchers          │
  └──────────────────────────────┘                   │   (Jellyfin, …)             │
